@@ -1,0 +1,46 @@
+name: Deploy and Update Jira
+
+on:
+  push:
+    branches: [ main ]  # ทำงานเมื่อมีการ push ไปยัง branch main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # ขั้นตอนที่ 1: Checkout code
+      - name: Checkout
+        uses: actions/checkout@v3
+        
+      # ขั้นตอนที่ 2: สร้าง Deployment
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          
+      # ขั้นตอนที่ 3: การ Deploy จริง (ใส่คำสั่งของคุณที่นี่)
+      - name: Deploy application
+        run: |
+          echo "Deploying version ${{ github.sha }}"
+          # คำสั่ง deploy ของคุณ เช่น
+          # npm ci
+          # npm run build
+          # npm run deploy
+          
+      # ขั้นตอนที่ 4: แจ้ง Jira โดยตรง (ถ้าต้องการเพิ่มเติมจาก GitHub integration)
+      - name: Update Jira
+        uses: atlassian/gajira-transition@v3
+        with:
+          issue: ${{ github.event.head_commit.message }}  # อ่าน issue ID จากข้อความ commit
+          transition: "Deployed to Production"
+          
+      # ขั้นตอนที่ 5: อัปเดตสถานะ Deployment
+      - name: Update deployment status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
