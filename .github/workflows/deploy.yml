@@ -1,32 +1,141 @@
-name: Simple Jira Update
+name: Track Daily Development Time
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ] # สำหรับการ deploy
+  schedule:
+    - cron: '0 17 * * 1-5' # ทำงานทุกวันทำงาน เวลา 17:00 น. สำหรับกรณีไม่มีการ deploy
 
 jobs:
-  jira-update:
+  track-dev-time:
     runs-on: ubuntu-latest
     steps:
+      # 1. Login to Jira
       - name: Login to Jira
         uses: atlassian/gajira-login@v3
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          
-      - name: Find Jira issue in commit
-        id: find
-        uses: atlassian/gajira-find-issue-key@v3
+      
+      # 2. Checkout code with full history
+      - name: Checkout
+        uses: actions/checkout@v3
         with:
-          string: ${{ github.event.head_commit.message }}
+          fetch-depth: 0
+      
+      # 3. Find Jira issue from branch name or commit message
+      - name: Find Jira issue
+        id: find_issue
+        run: |
+          # ดึงชื่อ branch ปัจจุบัน
+          BRANCH_NAME=$(git branch --show-current)
           
-      - name: Echo found issue
-        run: echo "Found issue ${{ steps.find.outputs.issue }}"
-        
-      - name: Update Jira (if issue found)
-        if: steps.find.outputs.issue != ''
-        uses: atlassian/gajira-comment@v3
-        with:
-          issue: ${{ steps.find.outputs.issue }}
-          comment: "🚀 Deployed to production from commit ${{ github.sha }} by ${{ github.actor }}"
+          # ค้นหารหัส Jira จากชื่อ branch หรือ commit message
+          if [[ $BRANCH_NAME =~ ([A-Z]+-[0-9]+) ]]; then
+            ISSUE_KEY="${BASH_REMATCH[1]}"
+          elif [[ "${{ github.event.head_commit.message }}" =~ ([A-Z]+-[0-9]+) ]]; then
+            ISSUE_KEY="${BASH_REMATCH[1]}"
+          else
+            # ถ้าไม่พบรหัส issue ให้ข้ามขั้นตอนนี้
+            echo "No Jira issue found in branch name or commit message"
+            exit 0
+          fi
+          
+          echo "Found Jira issue: $ISSUE_KEY"
+          echo "issue=$ISSUE_KEY" >> $GITHUB_OUTPUT
+      
+      # 4. Calculate work time for today only
+      - name: Calculate today's work time
+        id: calc_time
+        if: steps.find_issue.outputs.issue != ''
+        run: |
+          ISSUE_KEY="${{ steps.find_issue.outputs.issue }}"
+          
+          # ตรวจสอบว่าเป็นการ deploy หรือการทำงานตามกำหนดเวลา
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            IS_DEPLOY=true
+            echo "This is a deployment event"
+          else
+            IS_DEPLOY=false
+            echo "This is a scheduled check (no deployment)"
+          fi
+          
+          # ดึงเวลาเริ่มต้นของวันนี้ (00:00:00)
+          TODAY_START=$(date -d "today 00:00:00" +%s)
+          
+          # ดึงเวลาปัจจุบัน
+          CURRENT_TIME=$(date +%s)
+          
+          # ค้นหาเวลาที่สร้าง branch
+          BRANCH_NAME=$(git branch --show-current)
+          BRANCH_CREATED=$(git log --follow --date=unix --format=%cd $BRANCH_NAME | tail -1)
+          
+          echo "Branch created at: $(date -d @$BRANCH_CREATED)"
+          echo "Today starts at: $(date -d @$TODAY_START)"
+          
+          # ตรวจสอบว่า branch ถูกสร้างในวันนี้หรือไม่
+          if [[ $BRANCH_CREATED -ge $TODAY_START ]]; then
+            # Branch ถูกสร้างในวันนี้ - ใช้เวลาตั้งแต่สร้าง branch
+            START_TIME=$BRANCH_CREATED
+            echo "Branch was created today, using branch creation time"
+          else
+            # Branch ถูกสร้างก่อนวันนี้ - ใช้เวลาเริ่มต้นของวันนี้
+            START_TIME=$TODAY_START
+            echo "Branch was created before today, using start of today"
+          fi
+          
+          # คำนวณระยะเวลาในหน่วยนาที
+          MINUTES=$(( ($CURRENT_TIME - $START_TIME) / 60 ))
+          HOURS=$(( $MINUTES / 60 ))
+          REMAINING_MINUTES=$(( $MINUTES % 60 ))
+          
+          # กำหนดรูปแบบเวลาสำหรับ Jira worklog
+          if [ $HOURS -gt 0 ]; then
+            TIME_SPENT="${HOURS}h ${REMAINING_MINUTES}m"
+          else
+            TIME_SPENT="${MINUTES}m"
+          fi
+          
+          # สร้างข้อความสำหรับ worklog
+          if [[ "$IS_DEPLOY" == "true" ]]; then
+            COMMENT="🚀 เวลาทำงานวันนี้จนถึงการ deploy: $TIME_SPENT"
+          else
+            COMMENT="🕒 เวลาทำงานสำหรับวันนี้: $TIME_SPENT (บันทึกอัตโนมัติ)"
+          fi
+          
+          echo "time_spent=$TIME_SPENT" >> $GITHUB_OUTPUT
+          echo "started=$(date -u -d "@$START_TIME" +"%Y-%m-%dT%H:%M:%S.000+0000")" >> $GITHUB_OUTPUT
+          echo "comment=$COMMENT" >> $GITHUB_OUTPUT
+      
+      # 5. Add worklog to Jira
+      - name: Add worklog to Jira
+        if: steps.find_issue.outputs.issue != ''
+        run: |
+          ISSUE_KEY="${{ steps.find_issue.outputs.issue }}"
+          
+          # บันทึกเวลาทำงานใน Jira
+          curl --request POST \
+            --url "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${ISSUE_KEY}/worklog" \
+            --user "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
+            --header "Accept: application/json" \
+            --header "Content-Type: application/json" \
+            --data '{
+              "timeSpent": "${{ steps.calc_time.outputs.time_spent }}",
+              "comment": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "${{ steps.calc_time.outputs.comment }} (โดย ${{ github.actor }})"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "started": "${{ steps.calc_time.outputs.started }}"
+            }'
